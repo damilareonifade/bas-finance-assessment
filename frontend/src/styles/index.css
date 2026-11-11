@@ -1,0 +1,41 @@
+@import 'tailwindcss';
+
+@theme {
+  --color-brand: #002794;
+  --color-brand-strong: #000a58;
+  --color-brand-soft: #e6edff;
+  --color-surface: #ffffff;
+  --color-canvas: #f4f6fb;
+  --color-ink: #1b2430;
+  --color-ink-muted: #5b6676;
+  --color-line: #dfe3e9;
+  --color-success: #1a7f4b;
+  --color-success-soft: #e2f4ea;
+  --color-danger: #b42318;
+  --color-danger-soft: #fdeceb;
+  --color-warning: #9a6700;
+  --color-warning-soft: #fff4d6;
+  --color-sidebar: #000a58;
+  --color-sidebar-hover: #0b1a72;
+  --color-sidebar-active: #16299a;
+  --color-sidebar-ink: #c7d0f0;
+  --color-info: #0369a1;
+  --color-info-soft: #e0f2fe;
+  --color-teal: #0f766e;
+  --color-teal-soft: #ddf4f1;
+  --color-orange: #c2410c;
+  --color-orange-soft: #fff1e6;
+  --color-chart-cyan: #06a3c9;
+  --color-chart-blue: #0136f5;
+  --color-chart-green: #12a05c;
+  --color-chart-amber: #e8890c;
+  --color-sky: #eaf4fd;
+  --color-sky-deep: #cfe6fb;
+  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+body {
+  background-color: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+}

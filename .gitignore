@@ -1,0 +1,14 @@
+node_modules
+dist
+.env
+.DS_Store
+CLAUDE.md
+
+# Prisma client is generated on install (npm postinstall → prisma generate)
+backend/src/generated
+# Local SQLite database, its backups and uploaded KYC files
+backend/data
+# e2e template database
+backend/test/.tmp
+# Dev-server build output (separate from dist so builds never delete the running dev server)
+backend/.dev-dist

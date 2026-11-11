@@ -1,0 +1,15 @@
+{
+  "name": "loan-origination-to-repayment",
+  "private": true,
+  "workspaces": [
+    "frontend",
+    "backend"
+  ],
+  "scripts": {
+    "dev": "concurrently -n api,web -c blue,green \"npm run dev -w backend\" \"npm run dev -w frontend\"",
+    "test": "npm test -w backend && npm run test:e2e -w backend && npm test -w frontend"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.7"
+  }
+}

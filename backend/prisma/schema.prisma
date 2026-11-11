@@ -1,0 +1,462 @@
+// BAS Finance — persistence schema (Prisma, SQLite).
+//
+// Conventions
+// - Money columns are BigInt kobo (Prisma's Int is 32-bit and tops out at ₦21.47M; the brief goes to ₦5bn).
+//   Repositories convert with toKoboColumn / fromKoboColumn (src/database/kobo-column.ts) — never Number() by hand.
+// - Calendar dates ("2026-01-15") and timestamps (ISO-8601) are stored as text, exactly as they travel on the wire.
+// - Ids are readable strings from the `sequences` table (LN-000001, APP-000001 …).
+// - Status / role / type columns are strings whose allowed values are enforced by CHECK constraints in the migration SQL.
+// - Guards Prisma cannot express (CHECKs, the immutable-journal triggers, "one open document per type") live in the
+//   migration SQL. If `prisma migrate dev` ever generates a "RedefineTables" migration for one of these tables,
+//   re-add them by hand — test/database-guards.e2e-spec.ts fails if any guard goes missing.
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+/// Counters behind readable ids. Also the target of the write-lock statement every transaction starts with.
+model Sequence {
+  name  String @id
+  value Int
+
+  @@map("sequences")
+}
+
+/// Posting endpoints store their key here in the SAME transaction as the posting.
+model IdempotencyKey {
+  key          String @id
+  scope        String
+  requestHash  String @map("request_hash")
+  statusCode   Int    @map("status_code")
+  responseJson String @map("response_json")
+  createdAt    String @map("created_at")
+
+  @@map("idempotency_keys")
+}
+
+/**
+ * ───────────────────────────── People ─────────────────────────────
+ */
+
+model User {
+  id           String @id
+  email        String @unique
+  fullName     String @map("full_name")
+  role         String
+  passwordHash String @map("password_hash")
+  status       String
+  createdAt    String @map("created_at")
+
+  invitationsSent      Invitation[]               @relation("InvitationInvitedBy")
+  customersAssigned    Customer[]                 @relation("CustomerOfficer")
+  customersCreated     Customer[]                 @relation("CustomerCreatedBy")
+  productsCreated      LoanProduct[]              @relation("ProductCreatedBy")
+  loansCreated         TermLoan[]                 @relation("LoanCreatedBy")
+  loansApproved        TermLoan[]                 @relation("LoanApprovedBy")
+  loansAssigned        TermLoan[]                 @relation("LoanOfficer")
+  repaymentsTaken      Repayment[]                @relation("RepaymentCreatedBy")
+  invoicesCreated      Invoice[]                  @relation("InvoiceCreatedBy")
+  applicationsAssigned LoanApplication[]          @relation("ApplicationOfficer")
+  applicationsCreated  LoanApplication[]          @relation("ApplicationSubmittedBy")
+  applicationsReviewed LoanApplication[]          @relation("ApplicationReviewedBy")
+  applicationsDecided  LoanApplication[]          @relation("ApplicationDecidedBy")
+  documentsRequested   CustomerDocument[]         @relation("DocumentRequestedBy")
+  documentsSubmitted   CustomerDocument[]         @relation("DocumentSubmittedBy")
+  documentsReviewed    CustomerDocument[]         @relation("DocumentReviewedBy")
+  notifications        Notification[]
+  portalInvitesSent    CustomerPortalInvitation[] @relation("PortalInvitationInvitedBy")
+
+  @@index([role])
+  @@map("users")
+}
+
+model Invitation {
+  id         String  @id
+  email      String
+  role       String
+  tokenHash  String  @unique @map("token_hash")
+  invitedBy  String  @map("invited_by")
+  status     String
+  expiresAt  String  @map("expires_at")
+  createdAt  String  @map("created_at")
+  acceptedAt String? @map("accepted_at")
+
+  inviter User @relation("InvitationInvitedBy", fields: [invitedBy], references: [id])
+
+  @@index([email, status])
+  @@map("invitations")
+}
+
+model Customer {
+  id                String  @id
+  fullName          String  @map("full_name")
+  email             String?
+  phone             String?
+  assignedOfficerId String? @map("assigned_officer_id")
+  createdBy         String? @map("created_by")
+  createdAt         String  @map("created_at")
+
+  assignedOfficer User?                      @relation("CustomerOfficer", fields: [assignedOfficerId], references: [id])
+  creator         User?                      @relation("CustomerCreatedBy", fields: [createdBy], references: [id])
+  loans           TermLoan[]
+  invoices        Invoice[]
+  applications    LoanApplication[]
+  documents       CustomerDocument[]
+  portalAccount   CustomerAccount?
+  portalInvites   CustomerPortalInvitation[]
+  notifications   CustomerNotification[]
+
+  @@index([assignedOfficerId])
+  @@index([createdAt])
+  @@map("customers")
+}
+
+/**
+ * ───────────────────────────── Products ─────────────────────────────
+ */
+
+model LoanProduct {
+  id                   String  @id
+  name                 String  @unique
+  type                 String
+  description          String?
+  minPrincipalKobo     BigInt  @map("min_principal_kobo")
+  maxPrincipalKobo     BigInt  @map("max_principal_kobo")
+  minAnnualRatePercent Float?  @map("min_annual_rate_percent")
+  maxAnnualRatePercent Float?  @map("max_annual_rate_percent")
+  minTermMonths        Int?    @map("min_term_months")
+  maxTermMonths        Int?    @map("max_term_months")
+  status               String
+  createdBy            String? @map("created_by")
+  createdAt            String  @map("created_at")
+
+  creator      User?             @relation("ProductCreatedBy", fields: [createdBy], references: [id])
+  loans        TermLoan[]
+  invoices     Invoice[]
+  applications LoanApplication[]
+
+  @@index([status])
+  @@map("loan_products")
+}
+
+/**
+ * ───────────────────────────── Ledger ─────────────────────────────
+ */
+
+/// Immutable (triggers reject UPDATE / DELETE). Corrections are reversing entries.
+model JournalEntry {
+  id              String  @id
+  event           String
+  postedOn        String  @map("posted_on")
+  loanId          String? @map("loan_id")
+  invoiceId       String? @map("invoice_id")
+  customerId      String? @map("customer_id")
+  reversesEntryId String? @unique @map("reverses_entry_id")
+  createdAt       String  @map("created_at")
+
+  lines      JournalLine[]
+  repayment  Repayment?
+  settlement InvoiceSettlement?
+
+  @@index([loanId])
+  @@index([invoiceId])
+  @@index([customerId])
+  @@map("journal_entries")
+}
+
+/// One side per line (CHECK): exactly one of debit / credit is positive. Zero lines are never posted.
+model JournalLine {
+  entryId    String @map("entry_id")
+  lineNo     Int    @map("line_no")
+  account    String
+  debitKobo  BigInt @map("debit_kobo")
+  creditKobo BigInt @map("credit_kobo")
+
+  entry JournalEntry @relation(fields: [entryId], references: [id])
+
+  @@id([entryId, lineNo])
+  @@index([account])
+  @@map("journal_lines")
+}
+
+/**
+ * ───────────────────────────── Term loans ─────────────────────────────
+ */
+
+model TermLoan {
+  id                  String  @id
+  customerId          String? @map("customer_id")
+  loanProductId       String? @map("loan_product_id")
+  principalKobo       BigInt  @map("principal_kobo")
+  annualRatePercent   Float   @map("annual_rate_percent")
+  termMonths          Int     @map("term_months")
+  instalmentKobo      BigInt  @map("instalment_kobo")
+  disbursedOn         String  @map("disbursed_on")
+  /// Customer money held as a liability (over-payments). CHECK ≥ 0.
+  unappliedCreditKobo BigInt  @default(0) @map("unapplied_credit_kobo")
+  createdBy           String? @map("created_by")
+  createdAt           String  @map("created_at")
+  approvedBy          String? @map("approved_by")
+  approvedAt          String? @map("approved_at")
+  assignedOfficerId   String? @map("assigned_officer_id")
+  applicationId       String? @unique @map("application_id")
+  /// Bumped by TermLoansRepository.lockForUpdate() as the first write of every money movement on the loan.
+  lockVersion         Int     @default(0) @map("lock_version")
+
+  customer        Customer?        @relation(fields: [customerId], references: [id])
+  product         LoanProduct?     @relation(fields: [loanProductId], references: [id])
+  creator         User?            @relation("LoanCreatedBy", fields: [createdBy], references: [id])
+  approver        User?            @relation("LoanApprovedBy", fields: [approvedBy], references: [id])
+  assignedOfficer User?            @relation("LoanOfficer", fields: [assignedOfficerId], references: [id])
+  instalments     LoanInstalment[]
+  repayments      Repayment[]
+
+  @@index([customerId])
+  @@index([loanProductId])
+  @@index([approvedBy])
+  @@index([assignedOfficerId])
+  @@index([disbursedOn])
+  @@map("term_loans")
+}
+
+/// What was scheduled and what has been collected. CHECKs stop any component being over-collected.
+model LoanInstalment {
+  loanId             String @map("loan_id")
+  instalmentNumber   Int    @map("instalment_number")
+  dueDate            String @map("due_date")
+  paymentKobo        BigInt @map("payment_kobo")
+  interestKobo       BigInt @map("interest_kobo")
+  principalKobo      BigInt @map("principal_kobo")
+  closingBalanceKobo BigInt @map("closing_balance_kobo")
+  penaltyPaidKobo    BigInt @default(0) @map("penalty_paid_kobo")
+  feePaidKobo        BigInt @default(0) @map("fee_paid_kobo")
+  interestPaidKobo   BigInt @default(0) @map("interest_paid_kobo")
+  principalPaidKobo  BigInt @default(0) @map("principal_paid_kobo")
+
+  loan TermLoan @relation(fields: [loanId], references: [id])
+
+  @@id([loanId, instalmentNumber])
+  @@map("loan_instalments")
+}
+
+model Repayment {
+  id             String  @id
+  loanId         String  @map("loan_id")
+  amountKobo     BigInt  @map("amount_kobo")
+  paymentDate    String  @map("payment_date")
+  allocationJson String  @map("allocation_json")
+  unappliedKobo  BigInt  @map("unapplied_kobo")
+  journalEntryId String  @unique @map("journal_entry_id")
+  createdBy      String? @map("created_by")
+  createdAt      String  @map("created_at")
+
+  loan         TermLoan     @relation(fields: [loanId], references: [id])
+  journalEntry JournalEntry @relation(fields: [journalEntryId], references: [id])
+  creator      User?        @relation("RepaymentCreatedBy", fields: [createdBy], references: [id])
+
+  @@index([loanId])
+  @@index([paymentDate])
+  @@map("repayments")
+}
+
+/**
+ * ───────────────────────────── Invoice financing ─────────────────────────────
+ */
+
+model Invoice {
+  id              String  @id
+  customerId      String? @map("customer_id")
+  loanProductId   String? @map("loan_product_id")
+  faceValueKobo   BigInt  @map("face_value_kobo")
+  issueDate       String  @map("issue_date")
+  dueDate         String  @map("due_date")
+  tenorDays       Int     @map("tenor_days")
+  advanceKobo     BigInt  @map("advance_kobo")
+  reserveKobo     BigInt  @map("reserve_kobo")
+  discountFeeKobo BigInt  @map("discount_fee_kobo")
+  /// ADVANCED → SETTLED, moved only by a compare-and-set update (InvoicesRepository.claimForSettlement).
+  status          String
+  createdBy       String? @map("created_by")
+  createdAt       String  @map("created_at")
+
+  customer   Customer?          @relation(fields: [customerId], references: [id])
+  product    LoanProduct?       @relation(fields: [loanProductId], references: [id])
+  creator    User?              @relation("InvoiceCreatedBy", fields: [createdBy], references: [id])
+  settlement InvoiceSettlement?
+
+  @@index([customerId])
+  @@index([loanProductId])
+  @@index([issueDate])
+  @@map("invoices")
+}
+
+model InvoiceSettlement {
+  id                 String @id
+  invoiceId          String @unique @map("invoice_id")
+  settlementDate     String @map("settlement_date")
+  daysOverdue        Int    @map("days_overdue")
+  discountFeeKobo    BigInt @map("discount_fee_kobo")
+  latePenaltyKobo    BigInt @map("late_penalty_kobo")
+  totalChargesKobo   BigInt @map("total_charges_kobo")
+  clientReceivesKobo BigInt @map("client_receives_kobo")
+  clientOwesKobo     BigInt @map("client_owes_kobo")
+  journalEntryId     String @unique @map("journal_entry_id")
+  createdAt          String @map("created_at")
+
+  invoice      Invoice      @relation(fields: [invoiceId], references: [id])
+  journalEntry JournalEntry @relation(fields: [journalEntryId], references: [id])
+
+  @@map("invoice_settlements")
+}
+
+/**
+ * ───────────────────────────── Applicants ─────────────────────────────
+ */
+
+model LoanApplication {
+  id                String  @id
+  customerId        String  @map("customer_id")
+  loanProductId     String? @map("loan_product_id")
+  principalKobo     BigInt  @map("principal_kobo")
+  annualRatePercent Float   @map("annual_rate_percent")
+  termMonths        Int     @map("term_months")
+  purpose           String?
+  /// SUBMITTED → UNDER_REVIEW → APPROVED | REJECTED, moved only by compare-and-set updates.
+  status            String
+  assignedOfficerId String? @map("assigned_officer_id")
+  /// STAFF (entered by a team member, who is submittedBy) or PORTAL (the applicant applied online; submittedBy is null).
+  channel           String  @default("STAFF")
+  submittedBy       String? @map("submitted_by")
+  submittedAt       String  @map("submitted_at")
+  reviewedBy        String? @map("reviewed_by")
+  reviewStartedAt   String? @map("review_started_at")
+  decidedBy         String? @map("decided_by")
+  decidedAt         String? @map("decided_at")
+  rejectionReason   String? @map("rejection_reason")
+  loanId            String? @unique @map("loan_id")
+
+  customer        Customer     @relation(fields: [customerId], references: [id])
+  product         LoanProduct? @relation(fields: [loanProductId], references: [id])
+  assignedOfficer User?        @relation("ApplicationOfficer", fields: [assignedOfficerId], references: [id])
+  submitter       User?        @relation("ApplicationSubmittedBy", fields: [submittedBy], references: [id])
+  reviewer        User?        @relation("ApplicationReviewedBy", fields: [reviewedBy], references: [id])
+  decider         User?        @relation("ApplicationDecidedBy", fields: [decidedBy], references: [id])
+
+  @@index([status])
+  @@index([customerId])
+  @@index([assignedOfficerId])
+  @@index([decidedBy])
+  @@map("loan_applications")
+}
+
+/// KYC. A trigger allows at most one open (REQUESTED or SUBMITTED) document per customer and type.
+model CustomerDocument {
+  id                  String  @id
+  customerId          String  @map("customer_id")
+  type                String
+  status              String
+  identifier          String?
+  fileName            String? @map("file_name")
+  filePath            String? @map("file_path")
+  fileMime            String? @map("file_mime")
+  fileSize            Int?    @map("file_size")
+  requestNote         String? @map("request_note")
+  requestedBy         String? @map("requested_by")
+  requestedAt         String? @map("requested_at")
+  submittedBy         String? @map("submitted_by")
+  /// True when the customer uploaded it themselves through the portal (submittedBy is then null).
+  submittedByCustomer Boolean @default(false) @map("submitted_by_customer")
+  submittedAt         String? @map("submitted_at")
+  reviewedBy          String? @map("reviewed_by")
+  reviewedAt          String? @map("reviewed_at")
+  reviewNote          String? @map("review_note")
+  createdAt           String  @map("created_at")
+
+  customer  Customer @relation(fields: [customerId], references: [id])
+  requester User?    @relation("DocumentRequestedBy", fields: [requestedBy], references: [id])
+  submitter User?    @relation("DocumentSubmittedBy", fields: [submittedBy], references: [id])
+  reviewer  User?    @relation("DocumentReviewedBy", fields: [reviewedBy], references: [id])
+
+  @@index([customerId, type, status])
+  @@map("customer_documents")
+}
+
+model Notification {
+  id        String  @id
+  userId    String  @map("user_id")
+  kind      String
+  title     String
+  body      String
+  link      String?
+  createdAt String  @map("created_at")
+  readAt    String? @map("read_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, readAt])
+  @@map("notifications")
+}
+
+/**
+ * ───────────────────────────── Customer portal ─────────────────────────────
+ */
+
+/// A customer's own sign-in for the self-service portal. Separate from staff `users` on purpose: a customer session can
+/// never satisfy a staff route, and a customer is always tied to exactly one customer record.
+model CustomerAccount {
+  id           String  @id
+  customerId   String  @unique @map("customer_id")
+  email        String  @unique
+  passwordHash String  @map("password_hash")
+  /// ACTIVE | DISABLED (CHECK). Disabling takes effect on the next request.
+  status       String
+  createdAt    String  @map("created_at")
+  lastLoginAt  String? @map("last_login_at")
+
+  customer Customer @relation(fields: [customerId], references: [id])
+
+  @@map("customer_accounts")
+}
+
+/// One-time link staff share with a customer so they can set their portal password (token stored hashed).
+model CustomerPortalInvitation {
+  id         String  @id
+  customerId String  @map("customer_id")
+  email      String
+  tokenHash  String  @unique @map("token_hash")
+  invitedBy  String  @map("invited_by")
+  /// PENDING → ACCEPTED | REVOKED (CHECK), moved only by compare-and-set.
+  status     String
+  expiresAt  String  @map("expires_at")
+  createdAt  String  @map("created_at")
+  acceptedAt String? @map("accepted_at")
+
+  customer Customer @relation(fields: [customerId], references: [id])
+  inviter  User     @relation("PortalInvitationInvitedBy", fields: [invitedBy], references: [id])
+
+  @@index([customerId, status])
+  @@map("customer_portal_invitations")
+}
+
+/// What the portal bell shows a customer (document requested, application decided, loan disbursed).
+model CustomerNotification {
+  id         String  @id
+  customerId String  @map("customer_id")
+  kind       String
+  title      String
+  body       String
+  link       String?
+  createdAt  String  @map("created_at")
+  readAt     String? @map("read_at")
+
+  customer Customer @relation(fields: [customerId], references: [id])
+
+  @@index([customerId, readAt])
+  @@map("customer_notifications")
+}
